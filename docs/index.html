@@ -1,0 +1,933 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Stream</title>
+<meta name="description" content="Replay and live-tail Claude Code chat sessions from a Durable Streams server.">
+<style>
+  :root {
+    --bg: #12100e;
+    --bg-raised: #1b1815;
+    --bg-sunken: #0d0b0a;
+    --line: #2e2926;
+    --line-soft: #241f1c;
+    --fg: #ece7e1;
+    --fg-dim: #a39a91;
+    --fg-faint: #6f665e;
+    --accent: #d97757;
+    --accent-soft: #46281e;
+    --user: #7aa2f7;
+    --ok: #7fbf7f;
+    --err: #e06c75;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  /* .ev sets display:flex, which would otherwise beat the hidden attribute. */
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 var(--sans);
+    display: flex;
+    flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---- top bar ---- */
+  .bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 14px;
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand {
+    font-weight: 650; letter-spacing: -.01em; margin-right: 4px;
+    display: flex; align-items: center; gap: 8px; white-space: nowrap;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint); flex: none; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(127,191,127,.7); animation: pulse 2s infinite; }
+  .dot.loading { background: var(--accent); animation: pulse 1s infinite; }
+  .dot.error { background: var(--err); }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 7px rgba(127,191,127,0); } 100% { box-shadow: 0 0 0 0 rgba(127,191,127,0); } }
+
+  input, select, button {
+    font: inherit; color: inherit;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 9px;
+  }
+  input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input::placeholder { color: var(--fg-faint); }
+  button { cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--fg-faint); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1a0f0a; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  .grow { flex: 1 1 260px; min-width: 160px; font-family: var(--mono); font-size: 13px; }
+  .bar label { color: var(--fg-dim); font-size: 13px; display: flex; align-items: center; gap: 5px; }
+
+  /* ---- filters row ---- */
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 7px 14px; background: var(--bg-raised);
+    border-bottom: 1px solid var(--line); font-size: 13px; color: var(--fg-dim);
+  }
+  .filters input[type=checkbox] { accent-color: var(--accent); margin: 0; }
+  .filters label { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  .spacer { flex: 1; }
+
+  /* ---- log ---- */
+  main {
+    flex: 1; overflow-y: auto; overscroll-behavior: contain;
+    padding: 18px 14px 120px;
+  }
+  .log { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  .empty { color: var(--fg-faint); text-align: center; padding: 60px 20px; font-size: 14px; }
+  .empty code { color: var(--fg-dim); }
+
+  .ev { display: flex; gap: 10px; align-items: flex-start; }
+  .rail { flex: none; width: 62px; text-align: right; padding-top: 2px;
+          font: 500 11px/1.7 var(--mono); color: var(--fg-faint); letter-spacing: .02em; }
+  .body { flex: 1; min-width: 0; }
+
+  .ev-user .body {
+    background: var(--bg-raised); border: 1px solid var(--line);
+    border-left: 3px solid var(--user); border-radius: var(--radius);
+    padding: 10px 13px;
+  }
+  .ev-user .rail { color: var(--user); }
+  .ev-assistant .body { padding: 1px 0; }
+  .ev-assistant .rail { color: var(--accent); }
+
+  .ev-header .body {
+    background: linear-gradient(180deg, var(--accent-soft), var(--bg-raised));
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px;
+  }
+  .ev-header h2 { margin: 0 0 4px; font-size: 16px; letter-spacing: -.01em; }
+  .ev-header .kv { font: 12px/1.7 var(--mono); color: var(--fg-dim); word-break: break-all; }
+
+  details { border-radius: 6px; }
+  details > summary {
+    cursor: pointer; list-style: none; user-select: none;
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: "\25B8"; color: var(--fg-faint); font-size: 11px; flex: none; }
+  details[open] > summary::before { content: "\25BE"; }
+
+  .ev-thinking .body { color: var(--fg-dim); font-style: italic; }
+  .ev-thinking .think-text { margin-top: 6px; font-style: normal; font-size: 14px; color: var(--fg-dim);
+                             border-left: 2px solid var(--line); padding-left: 12px; white-space: pre-wrap; }
+
+  .tool { background: var(--bg-sunken); border: 1px solid var(--line-soft); border-radius: var(--radius); overflow: hidden; }
+  .tool > summary { padding: 8px 11px; font: 13px/1.5 var(--mono); }
+  .tool .tname { color: var(--accent); font-weight: 600; }
+  .tool .targ { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+  .tool .tin, .tool .tout {
+    margin: 0; padding: 9px 12px; border-top: 1px solid var(--line-soft);
+    font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word;
+    max-height: 420px; overflow: auto; color: var(--fg-dim);
+  }
+  .tool .tout { background: #000; color: #cfc7bf; }
+  .tool.err { border-color: #5a2b2b; }
+  .tool.err .tout { color: var(--err); }
+  .pending { color: var(--fg-faint); font-size: 12px; padding: 7px 12px; border-top: 1px solid var(--line-soft); }
+
+  .ev-note .body { font: 12px/1.6 var(--mono); color: var(--fg-faint); }
+
+  /* prose */
+  .prose { word-wrap: break-word; }
+  .prose p { margin: 0 0 .7em; }
+  .prose p:last-child { margin-bottom: 0; }
+  .prose ul, .prose ol { margin: 0 0 .7em; padding-left: 1.3em; }
+  .prose li { margin: .15em 0; }
+  .prose h2, .prose h3, .prose h4 { font-size: 1.03em; font-weight: 650; margin: 1em 0 .4em; letter-spacing: -.01em; }
+  .prose code { font: 13px var(--mono); background: var(--bg-sunken); border: 1px solid var(--line-soft);
+                padding: .08em .35em; border-radius: 4px; }
+  .prose pre { background: var(--bg-sunken); border: 1px solid var(--line-soft); border-radius: 6px;
+               padding: 10px 12px; overflow-x: auto; margin: 0 0 .7em; }
+  .prose pre code { background: none; border: 0; padding: 0; font-size: 12.5px; line-height: 1.55; }
+  .prose a { color: var(--user); }
+  .prose blockquote { margin: 0 0 .7em; padding-left: 12px; border-left: 2px solid var(--line); color: var(--fg-dim); }
+  .trunc { display: inline-block; margin-top: 6px; font: 11px var(--mono); color: var(--fg-faint); }
+
+  .usage { font: 11px var(--mono); color: var(--fg-faint); margin-left: 8px; }
+
+  /* ---- status bar ---- */
+  .status {
+    position: sticky; bottom: 0; display: flex; gap: 14px; align-items: center;
+    padding: 7px 14px; background: var(--bg-raised); border-top: 1px solid var(--line);
+    font: 12px var(--mono); color: var(--fg-dim); flex-wrap: wrap;
+  }
+  .status .msg { flex: 1; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jump {
+    position: fixed; right: 20px; bottom: 54px; z-index: 5;
+    background: var(--accent); color: #1a0f0a; border: 0; border-radius: 999px;
+    padding: 7px 14px; font-size: 13px; font-weight: 600; box-shadow: 0 3px 14px rgba(0,0,0,.5);
+  }
+  .jump[hidden] { display: none; }
+
+  /* ---- picker dialog ---- */
+  dialog {
+    background: var(--bg-raised); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 0; width: min(760px, 94vw); max-height: 82vh;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.62); }
+  .dlg-head { display: flex; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+  .dlg-head input { flex: 1; }
+  .dlg-list { overflow-y: auto; max-height: 60vh; padding: 6px; }
+  .row {
+    display: flex; gap: 10px; align-items: baseline; width: 100%; text-align: left;
+    background: none; border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer;
+    font: 13px var(--mono);
+  }
+  .row:hover { background: var(--bg-sunken); }
+  .row .n { color: var(--fg-faint); min-width: 58px; text-align: right; flex: none; }
+  .row .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .tag { color: var(--ok); font-size: 11px; flex: none; }
+  .dlg-empty { padding: 26px; text-align: center; color: var(--fg-faint); font-size: 13px; }
+
+  @media (max-width: 700px) {
+    .rail { width: 0; overflow: hidden; }
+    .ev { gap: 0; }
+    main { padding: 14px 10px 110px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <span class="brand"><span class="dot" id="dot"></span> Claude Stream</span>
+  <input class="grow" id="server" placeholder="https://yasdb.fly.dev" spellcheck="false" aria-label="Server URL">
+  <input class="grow" id="stream" placeholder="/claude/project/session-id" spellcheck="false" aria-label="Stream path">
+  <button id="browse" title="List streams on this server">Browse</button>
+  <label>from
+    <select id="from">
+      <option value="start">start</option>
+      <option value="end">end</option>
+    </select>
+  </label>
+  <label>play
+    <select id="speed">
+      <option value="0">instant</option>
+      <option value="8">8x</option>
+      <option value="1">1x</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="live" checked> live tail</label>
+  <button class="primary" id="go">Connect</button>
+</header>
+
+<div class="filters">
+  <label><input type="checkbox" id="f-thinking" checked> thinking</label>
+  <label><input type="checkbox" id="f-tools" checked> tool calls</label>
+  <label><input type="checkbox" id="f-results" checked> tool results</label>
+  <label><input type="checkbox" id="f-notes"> notes</label>
+  <span class="spacer"></span>
+  <label><input type="checkbox" id="f-autoscroll" checked> follow output</label>
+  <button id="clear">Clear</button>
+</div>
+
+<main id="scroller">
+  <div class="log" id="log">
+    <div class="empty" id="empty">
+      Point this at a stream and press <code>Connect</code>.<br><br>
+      Publish one with <code>dcs push latest</code>.
+    </div>
+  </div>
+</main>
+
+<button class="jump" id="jump" hidden>new output</button>
+
+<footer class="status">
+  <span class="msg" id="msg">idle</span>
+  <span id="count">0 events</span>
+  <span id="offset"></span>
+</footer>
+
+<dialog id="picker">
+  <div class="dlg-head">
+    <input id="filter" value="/claude" placeholder="Path prefix, e.g. /claude" spellcheck="false"
+           aria-label="Stream path prefix">
+    <button id="reload">Reload</button>
+    <button id="close-picker">Close</button>
+  </div>
+  <div class="dlg-list" id="picker-list"></div>
+</dialog>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  dot: $("dot"), server: $("server"), stream: $("stream"), from: $("from"),
+  speed: $("speed"), live: $("live"), go: $("go"), browse: $("browse"),
+  log: $("log"), empty: $("empty"), scroller: $("scroller"), jump: $("jump"),
+  msg: $("msg"), count: $("count"), offset: $("offset"), clear: $("clear"),
+  picker: $("picker"), pickerList: $("picker-list"), filter: $("filter"),
+  closePicker: $("close-picker"), reload: $("reload"),
+  fThinking: $("f-thinking"), fTools: $("f-tools"), fResults: $("f-results"),
+  fNotes: $("f-notes"), fAutoscroll: $("f-autoscroll"),
+};
+
+const DEFAULT_SERVER = "https://yasdb.fly.dev";
+const STORE_KEY = "claude-stream/settings";
+
+const FILTERS = {
+  thinking: els.fThinking, tools: els.fTools,
+  results: els.fResults, notes: els.fNotes,
+};
+
+/* ------------------------------------------------------------------ config */
+
+function loadSettings() {
+  const q = new URLSearchParams(location.search);
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || "{}"); } catch (e) {}
+  const pick = (k, fallback) => {
+    const v = q.get(k);
+    if (v !== null) return v;
+    if (saved[k] !== undefined) return saved[k];
+    return fallback;
+  };
+  els.server.value = pick("server", DEFAULT_SERVER);
+  els.stream.value = pick("stream", "");
+  els.from.value = pick("from", "start") === "end" ? "end" : "start";
+  els.speed.value = pick("speed", "0");
+  els.live.checked = pick("live", "1") !== "0";
+  for (const key of Object.keys(FILTERS)) {
+    const v = pick(key, null);
+    if (v !== null) FILTERS[key].checked = v !== "0";
+  }
+}
+
+function settings() {
+  const s = {
+    server: els.server.value.trim() || DEFAULT_SERVER,
+    stream: els.stream.value.trim(),
+    from: els.from.value,
+    speed: els.speed.value,
+    live: els.live.checked ? "1" : "0",
+  };
+  for (const key of Object.keys(FILTERS)) s[key] = FILTERS[key].checked ? "1" : "0";
+  return s;
+}
+
+function saveSettings() {
+  const s = settings();
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(s)); } catch (e) {}
+  const q = new URLSearchParams();
+  q.set("server", s.server);
+  if (s.stream) q.set("stream", s.stream);
+  q.set("from", s.from);
+  if (s.speed !== "0") q.set("speed", s.speed);
+  if (s.live === "0") q.set("live", "0");
+  history.replaceState(null, "", location.pathname + "?" + q.toString());
+}
+
+function streamURL(path, params) {
+  const base = settings().server.replace(/\/+$/, "");
+  const url = new URL(base + "/" + String(path).replace(/^\/+/, ""));
+  for (const k of Object.keys(params || {})) {
+    if (params[k] != null) url.searchParams.set(k, params[k]);
+  }
+  return url.toString();
+}
+
+/* ------------------------------------------------------------------- status */
+
+function setStatus(state, message) {
+  els.dot.className = "dot" + (state ? " " + state : "");
+  if (message !== undefined) els.msg.textContent = message;
+}
+
+/* --------------------------------------------------------------- rendering */
+
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+/* A deliberately small Markdown subset: fenced code, headings, lists,
+   blockquotes, inline code, bold, italic and links. Everything is escaped
+   first, so stream content can never inject markup. */
+function markdown(src) {
+  const blocks = [];
+  const text = escapeHTML(src).replace(/```([\w.+-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    blocks.push("<pre><code>" + code.replace(/\n$/, "") + "</code></pre>");
+    return "\n " + (blocks.length - 1) + " \n";
+  });
+
+  const inline = (s) => s
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+
+  const out = [];
+  let list = null;
+  const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+
+  for (const line of text.split("\n")) {
+    const ph = line.match(/^ (\d+) $/);
+    if (ph) { closeList(); out.push(blocks[Number(ph[1])]); continue; }
+    if (!line.trim()) { closeList(); continue; }
+
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      closeList();
+      const level = Math.min(m[1].length + 1, 4);
+      out.push("<h" + level + ">" + inline(m[2]) + "</h" + level + ">");
+    } else if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      if (list !== "ul") { closeList(); out.push("<ul>"); list = "ul"; }
+      out.push("<li>" + inline(m[1]) + "</li>");
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      if (list !== "ol") { closeList(); out.push("<ol>"); list = "ol"; }
+      out.push("<li>" + inline(m[1]) + "</li>");
+    } else if ((m = line.match(/^&gt;\s?(.*)$/))) { // escaped before this point
+      closeList();
+      out.push("<blockquote>" + inline(m[1]) + "</blockquote>");
+    } else {
+      closeList();
+      out.push("<p>" + inline(line) + "</p>");
+    }
+  }
+  closeList();
+  return out.join("");
+}
+
+const clock = (ts) => {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? "" : d.toTimeString().slice(0, 8);
+};
+
+/* A one-line gist of a tool call, so the collapsed row is still informative. */
+function toolSummary(tool) {
+  if (!tool || !tool.input) return "";
+  const input = tool.input;
+  if (typeof input === "string") return input;
+  const preferred = ["command", "file_path", "path", "pattern", "url", "query",
+                     "prompt", "description", "notebook_path", "old_string"];
+  for (const key of preferred) {
+    if (typeof input[key] === "string" && input[key]) return input[key];
+  }
+  try { return JSON.stringify(input); } catch (e) { return ""; }
+}
+
+const pretty = (v) => {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
+};
+
+function usageLabel(u) {
+  if (!u) return "";
+  const parts = [];
+  if (u.output) parts.push(u.output + " out");
+  if (u.thinking) parts.push(u.thinking + " think");
+  return parts.join(" / ");
+}
+
+/* Each tool_use keeps its element around so the tool_result that answers it can
+   be nested underneath rather than rendered as a loose row. */
+const toolNodes = new Map();
+let rendered = 0;
+
+function el(tag, cls, html) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (html != null) n.innerHTML = html;
+  return n;
+}
+
+function addEvent(ev) {
+  const node = renderEvent(ev);
+  if (!node) return;
+  els.empty.hidden = true;
+  els.log.appendChild(node);
+  rendered++;
+  els.count.textContent = rendered + (rendered === 1 ? " event" : " events");
+  applyFilters();
+  maybeScroll();
+}
+
+function renderEvent(ev) {
+  switch (ev.kind) {
+    case "header": return renderHeader(ev);
+    case "user": return simple(ev, "user", "You");
+    case "assistant": return simple(ev, "assistant", "Claude");
+    case "thinking": return renderThinking(ev);
+    case "tool_use": return renderToolUse(ev);
+    case "tool_result": return renderToolResult(ev);
+    case "title": return note(ev, "title: " + ev.text);
+    case "summary": return note(ev, "summary: " + ev.text);
+    case "system": return note(ev, "system: " + ev.text);
+    default: return note(ev, ev.text || ev.kind || "");
+  }
+}
+
+function wrap(ev, kind, railText) {
+  const row = el("div", "ev ev-" + kind);
+  row.dataset.kind = ev.kind;
+  row.appendChild(el("div", "rail", escapeHTML(railText === undefined ? clock(ev.ts) : railText)));
+  const body = el("div", "body");
+  row.appendChild(body);
+  return { row: row, body: body };
+}
+
+function renderHeader(ev) {
+  const parts = wrap(ev, "header", "");
+  const meta = ev.meta || {};
+  parts.body.appendChild(el("h2", null, escapeHTML(ev.text || meta.title || "Claude session")));
+  const bits = [];
+  if (meta.cwd) bits.push(escapeHTML(meta.cwd));
+  if (meta.gitBranch) bits.push("branch " + escapeHTML(meta.gitBranch));
+  if (ev.session) bits.push("session " + escapeHTML(String(ev.session).slice(0, 8)));
+  if (meta.startedAt) bits.push("published " + escapeHTML(meta.startedAt));
+  parts.body.appendChild(el("div", "kv", bits.join("   ")));
+  return parts.row;
+}
+
+function simple(ev, kind, label) {
+  const parts = wrap(ev, kind, label);
+  parts.body.appendChild(el("div", "prose", markdown(ev.text || "")));
+  const extra = [];
+  if (ev.model && kind === "assistant") extra.push(escapeHTML(ev.model));
+  const u = usageLabel(ev.usage);
+  if (u) extra.push(u);
+  if (extra.length) parts.body.appendChild(el("div", "usage", extra.join(" / ")));
+  if (ev.truncated) parts.body.appendChild(el("div", "trunc", "truncated by the publisher"));
+  return parts.row;
+}
+
+function renderThinking(ev) {
+  const parts = wrap(ev, "thinking", "thinking");
+  const d = el("details");
+  const text = ev.text || "";
+  const head = text.split("\n").find((l) => l.trim()) || "";
+  d.appendChild(el("summary", null, "<span>" + escapeHTML(head.slice(0, 110)) + "</span>"));
+  d.appendChild(el("div", "think-text", escapeHTML(text)));
+  parts.body.appendChild(d);
+  return parts.row;
+}
+
+function renderToolUse(ev) {
+  const parts = wrap(ev, "tool", "tool");
+  const tool = ev.tool || {};
+  const d = el("details", "tool");
+  const gist = toolSummary(tool).split("\n")[0].slice(0, 200);
+  d.appendChild(el("summary", null,
+    '<span class="tname">' + escapeHTML(tool.name || "tool") + "</span>" +
+    '<span class="targ">' + escapeHTML(gist) + "</span>"));
+  d.appendChild(el("pre", "tin", escapeHTML(pretty(tool.input))));
+  const pending = el("div", "pending", "waiting for result");
+  d.appendChild(pending);
+  parts.body.appendChild(d);
+  if (tool.id) toolNodes.set(tool.id, { details: d, pending: pending });
+  return parts.row;
+}
+
+function renderToolResult(ev) {
+  const tool = ev.tool || {};
+  const slot = tool.id ? toolNodes.get(tool.id) : null;
+  const text = ev.text || "";
+  const out = el("pre", "tout",
+    escapeHTML(text) + (ev.truncated ? "\n\n[truncated by the publisher]" : ""));
+
+  if (slot) {
+    slot.pending.remove();
+    slot.details.appendChild(out);
+    if (tool.isError) {
+      slot.details.classList.add("err");
+      const targ = slot.details.querySelector(".targ");
+      if (targ) targ.textContent += "  (error)";
+    }
+    toolNodes.delete(tool.id);
+    maybeScroll();
+    return null;
+  }
+
+  const parts = wrap(ev, "tool", "result");
+  const d = el("details", "tool" + (tool.isError ? " err" : ""));
+  d.appendChild(el("summary", null,
+    '<span class="tname">result</span><span class="targ">' +
+    escapeHTML(text.split("\n")[0].slice(0, 200)) + "</span>"));
+  d.appendChild(out);
+  parts.body.appendChild(d);
+  return parts.row;
+}
+
+function note(ev, text) {
+  const parts = wrap(ev, "note", "");
+  parts.body.textContent = text;
+  return parts.row;
+}
+
+/* ---------------------------------------------------------------- filtering */
+
+const FILTER_KINDS = {
+  thinking: ["thinking"],
+  tools: ["tool_use"],
+  results: ["tool_result"],
+  notes: ["title", "summary", "system", "meta"],
+};
+
+function applyFilters() {
+  for (const key of Object.keys(FILTER_KINDS)) {
+    const on = FILTERS[key].checked;
+    for (const kind of FILTER_KINDS[key]) {
+      const nodes = els.log.querySelectorAll('[data-kind="' + kind + '"]');
+      for (const n of nodes) n.hidden = !on;
+    }
+  }
+}
+
+/* --------------------------------------------------------------- scrolling */
+
+let stick = true;
+els.scroller.addEventListener("scroll", () => {
+  const gap = els.scroller.scrollHeight - els.scroller.scrollTop - els.scroller.clientHeight;
+  stick = gap < 80;
+  els.jump.hidden = stick;
+});
+els.jump.addEventListener("click", () => {
+  stick = true;
+  els.jump.hidden = true;
+  els.scroller.scrollTo({ top: els.scroller.scrollHeight, behavior: "smooth" });
+});
+function maybeScroll() {
+  if (!els.fAutoscroll.checked || !stick) { els.jump.hidden = stick; return; }
+  els.scroller.scrollTop = els.scroller.scrollHeight;
+}
+
+/* --------------------------------------------------------------- connection */
+
+let session = null;
+
+function stop() {
+  if (session) {
+    session.stopped = true;
+    session.abort.abort();
+    session = null;
+  }
+  els.go.textContent = "Connect";
+  els.go.classList.add("primary");
+}
+
+function clearLog() {
+  els.log.textContent = "";
+  els.log.appendChild(els.empty);
+  els.empty.hidden = false;
+  toolNodes.clear();
+  rendered = 0;
+  els.count.textContent = "0 events";
+  els.offset.textContent = "";
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Paced playback: events queue up and drain at the chosen speed, so a replay can
+   be watched rather than dumped. Live records bypass the pacing entirely. */
+function makeQueue(state) {
+  const queue = [];
+  let draining = false;
+  let prevTs = null; // timestamp of the last rendered event, for pacing
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    while (queue.length && !state.stopped) {
+      const ev = queue[0];
+      const speed = Number(els.speed.value);
+      // Wait before rendering, based on the gap from the previous event. Pacing
+      // after the fact would never engage: records usually arrive one at a time,
+      // so the queue is empty again by the time the delay is considered.
+      if (speed > 0 && !state.live && prevTs !== null) {
+        const t = Date.parse(ev.ts || "");
+        const gap = (isNaN(t) || isNaN(prevTs)) ? 250 : Math.max(0, t - prevTs);
+        await sleep(Math.min(Math.max(gap / speed, 45), 1400));
+        if (state.stopped) break;
+      }
+      queue.shift();
+      addEvent(ev);
+      const t = Date.parse(ev.ts || "");
+      prevTs = isNaN(t) ? prevTs : t;
+      if (prevTs === null) prevTs = NaN; // start pacing even without timestamps
+    }
+    draining = false;
+  }
+
+  return {
+    push(ev) { queue.push(ev); drain(); },
+    async settle() { while ((queue.length || draining) && !state.stopped) await sleep(40); },
+  };
+}
+
+async function connect() {
+  stop();
+  clearLog();
+
+  const cfg = settings();
+  if (!cfg.stream) {
+    setStatus("error", "enter a stream path, or press Browse");
+    return;
+  }
+  saveSettings();
+
+  const state = { abort: new AbortController(), stopped: false, live: false };
+  session = state;
+  els.go.textContent = "Stop";
+  els.go.classList.remove("primary");
+
+  const queue = makeQueue(state);
+  const onRecord = (rec) => { if (rec && typeof rec === "object") queue.push(rec); };
+
+  try {
+    let offset = cfg.from === "end" ? "now" : "-1";
+
+    if (cfg.from === "start") {
+      setStatus("loading", "replaying history");
+      offset = await catchUp(cfg.stream, offset, state, onRecord);
+      await queue.settle();
+      if (state.stopped) return;
+    }
+
+    state.live = true;
+    if (!els.live.checked) {
+      setStatus("", "replay complete, live tail off");
+      return;
+    }
+    setStatus("live", cfg.from === "end" ? "live tailing from the end" : "caught up, live tailing");
+    await liveTail(cfg.stream, offset, state, onRecord);
+  } catch (err) {
+    if (state.stopped || err.name === "AbortError") return;
+    console.error(err);
+    setStatus("error", String(err.message || err));
+  } finally {
+    if (session === state) {
+      els.go.textContent = "Connect";
+      els.go.classList.add("primary");
+      session = null;
+    }
+  }
+}
+
+/* Catch-up reads: follow Stream-Next-Offset until the server reports up to date. */
+async function catchUp(path, offset, state, onRecord) {
+  for (let page = 0; page < 10000 && !state.stopped; page++) {
+    const resp = await fetch(streamURL(path, { offset: offset }), { signal: state.abort.signal });
+    if (resp.status === 404) throw new Error("stream not found: " + path);
+    if (!resp.ok) throw new Error("read failed: " + resp.status + " " + resp.statusText);
+
+    const next = resp.headers.get("Stream-Next-Offset") || offset;
+    const upToDate = resp.headers.get("Stream-Up-To-Date") === "true";
+    const closed = resp.headers.get("Stream-Closed") === "true";
+    const body = (await resp.text()).trim();
+
+    if (body) {
+      let records;
+      try { records = JSON.parse(body); } catch (e) { records = []; }
+      const list = Array.isArray(records) ? records : [records];
+      for (const r of list) onRecord(r);
+    }
+    els.offset.textContent = "@" + short(next);
+
+    if (closed) { setStatus("", "stream closed (EOF)"); return next; }
+    if (upToDate || next === offset) return next;
+    offset = next;
+  }
+  return offset;
+}
+
+/* Live tail over SSE. EventSource cannot resume from a moving offset, so the
+   body is parsed by hand and every reconnect uses the last control offset. */
+async function liveTail(path, offset, state, onRecord) {
+  let cursor = null;
+  let backoff = 500;
+
+  while (!state.stopped) {
+    let resp;
+    try {
+      resp = await fetch(streamURL(path, { offset: offset, live: "sse", cursor: cursor }), {
+        headers: { Accept: "text/event-stream" },
+        signal: state.abort.signal,
+      });
+    } catch (err) {
+      if (state.stopped || err.name === "AbortError") return;
+      setStatus("error", "reconnecting");
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, 8000);
+      continue;
+    }
+    if (!resp.ok || !resp.body) throw new Error("live tail failed: " + resp.status);
+    backoff = 500;
+    setStatus("live", "live tailing " + path);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let done = false;
+
+    while (!state.stopped) {
+      let chunk;
+      try { chunk = await reader.read(); } catch (e) { break; }
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+
+      let split;
+      while ((split = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        const parsed = parseSSE(frame);
+        if (!parsed) continue;
+
+        if (parsed.event === "data") {
+          let records;
+          try { records = JSON.parse(parsed.data); } catch (e) { records = []; }
+          const list = Array.isArray(records) ? records : [records];
+          for (const r of list) onRecord(r);
+        } else if (parsed.event === "control") {
+          let ctrl = {};
+          try { ctrl = JSON.parse(parsed.data); } catch (e) {}
+          if (ctrl.streamNextOffset) offset = ctrl.streamNextOffset;
+          cursor = ctrl.streamCursor || null;
+          els.offset.textContent = "@" + short(offset);
+          if (ctrl.streamClosed) {
+            setStatus("", "stream closed (EOF)");
+            done = true;
+          }
+        }
+      }
+    }
+    // cancel() rejects when the fetch was already aborted; swallow it so the
+    // abort does not surface as an unhandled rejection.
+    reader.cancel().catch(() => {});
+    if (done || state.stopped) return;
+    // The server hangs up periodically for CDN collapsing; reconnect quietly.
+  }
+}
+
+function parseSSE(frame) {
+  let event = "message";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (!data.length) return null;
+  return { event: event, data: data.join("") };
+}
+
+const short = (offset) => String(offset || "").split("_")[0].replace(/^0+/, "") || "0";
+
+/* ------------------------------------------------------------------ browser */
+
+let pickerToken = 0;
+let allStreams = [];
+
+/* The admin listing is ordered by path and its cursor is exclusive, so passing
+   the prefix itself as the opening cursor seeks straight to the first match and
+   paging can stop as soon as the paths move past it. A server holding thousands
+   of unrelated streams then costs one page, not hundreds. */
+async function openPicker() {
+  els.picker.showModal();
+  await loadStreams();
+}
+
+async function loadStreams() {
+  const token = ++pickerToken;
+  const prefix = els.filter.value.trim();
+  els.pickerList.innerHTML = '<div class="dlg-empty">Loading</div>';
+  try {
+    const base = settings().server.replace(/\/+$/, "");
+    let cursor = prefix;
+    let found = [];
+    for (let page = 0; page < 25 && found.length < 1000; page++) {
+      const url = new URL(base + "/__admin/streams");
+      url.searchParams.set("limit", "200");
+      if (cursor) url.searchParams.set("cursor", cursor);
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("listing streams failed: " + resp.status);
+      const body = await resp.json();
+      if (token !== pickerToken) return; // a newer request superseded this one
+      const streams = body.streams || [];
+      let past = false;
+      for (const s of streams) {
+        if (prefix && s.path.indexOf(prefix) !== 0) { past = true; break; }
+        found.push(s);
+      }
+      cursor = body.nextCursor;
+      if (past || !cursor || !streams.length) break;
+    }
+    allStreams = found;
+    drawPicker();
+  } catch (err) {
+    if (token !== pickerToken) return;
+    els.pickerList.innerHTML = '<div class="dlg-empty">' + escapeHTML(err.message) + "</div>";
+  }
+}
+
+function drawPicker() {
+  if (!allStreams.length) {
+    els.pickerList.innerHTML =
+      '<div class="dlg-empty">No streams under this prefix.<br>Clear the box to list everything.</div>';
+    return;
+  }
+  els.pickerList.textContent = "";
+  for (const s of allStreams.slice(0, 500)) {
+    const readers = ((s.readers && s.readers.sse) || 0) + ((s.readers && s.readers.longPoll) || 0);
+    const row = el("button", "row",
+      '<span class="n">' + s.records + "</span>" +
+      '<span class="p">' + escapeHTML(s.path) + "</span>" +
+      (readers ? '<span class="tag">' + readers + " live</span>" : "") +
+      (s.closed ? '<span class="tag" style="color:var(--fg-faint)">closed</span>' : ""));
+    row.addEventListener("click", () => {
+      els.stream.value = s.path;
+      els.picker.close();
+      connect();
+    });
+    els.pickerList.appendChild(row);
+  }
+  if (allStreams.length > 500) {
+    els.pickerList.appendChild(
+      el("div", "dlg-empty", "Showing the first 500 of " + allStreams.length + ". Narrow the prefix."));
+  }
+}
+
+/* ------------------------------------------------------------------- wiring */
+
+els.go.addEventListener("click", () => {
+  if (session) { stop(); setStatus("", "stopped"); } else { connect(); }
+});
+els.browse.addEventListener("click", openPicker);
+els.closePicker.addEventListener("click", () => els.picker.close());
+let pickerDebounce = null;
+els.filter.addEventListener("input", () => {
+  clearTimeout(pickerDebounce);
+  pickerDebounce = setTimeout(loadStreams, 250);
+});
+els.reload.addEventListener("click", loadStreams);
+els.clear.addEventListener("click", clearLog);
+for (const key of Object.keys(FILTERS)) {
+  FILTERS[key].addEventListener("change", () => { applyFilters(); saveSettings(); });
+}
+els.fAutoscroll.addEventListener("change", maybeScroll);
+for (const control of [els.server, els.stream, els.from, els.speed, els.live]) {
+  control.addEventListener("change", saveSettings);
+}
+els.stream.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+
+loadSettings();
+setStatus("", "idle");
+if (new URLSearchParams(location.search).get("stream")) connect();
+</script>
+</body>
+</html>
