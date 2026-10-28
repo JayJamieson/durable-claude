@@ -20,10 +20,12 @@ const usage = `dcs — stream Claude Code chats to a durable stream
 Usage:
   dcs list [selector]        List projects and chat sessions on disk
   dcs push [selector]        Replay and/or live-tail a session to a stream
+  dcs save [session-id]      Write a pushed session into ~/.claude/projects
   dcs cat  [selector]        Read a stream back in the terminal
   dcs url  [selector]        Print the viewer URL for a session
-  dcs rm   [selector]        Delete a session's stream from the server
+  dcs rm   [selector]        Delete a session's streams from the server
   dcs streams                List streams already on the server
+  dcs service install        Run "dcs push -all" from boot (systemd, with sudo)
   dcs version
 
 Selector (all commands):
@@ -47,7 +49,9 @@ Examples:
   dcs push latest                    # replay history, then follow live writes
   dcs push -from end -follow         # only what happens from now on
   dcs push my-project -reset         # start the stream over
+  dcs push -all                      # publish every session that changes from now on
   dcs cat latest -from start         # read it back without a browser
+  dcs save 529128a1 -follow          # on another machine, then: claude --resume <id>
 `
 
 func main() {
@@ -79,10 +83,14 @@ func run() error {
 		return cmdCat(ctx, args)
 	case "url", "open":
 		return cmdURL(ctx, args)
+	case "save":
+		return cmdSave(ctx, args)
 	case "rm", "delete":
 		return cmdRemove(ctx, args)
 	case "streams":
 		return cmdStreams(ctx, args)
+	case "service":
+		return cmdService(ctx, args)
 	case "version", "-v", "--version":
 		fmt.Println("dcs " + version)
 		return nil

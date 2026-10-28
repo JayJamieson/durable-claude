@@ -111,33 +111,42 @@ func filterProjects(projects []session.Project, sel string) []session.Project {
 
 // pick shows a numbered menu of sessions and returns the chosen one.
 func pick(sessions []session.Session) (session.Session, error) {
-	if len(sessions) == 1 {
-		return sessions[0], nil
-	}
-	max := len(sessions)
-	if max > 20 {
-		max = 20
-	}
-	fmt.Fprintln(os.Stderr, "Select a session to stream:")
-	for i := 0; i < max; i++ {
+	i, err := choose("Select a session to stream:", len(sessions), func(i int) string {
 		s := sessions[i]
-		fmt.Fprintf(os.Stderr, "  %2d) %s  %s\n", i+1, bold(truncate(s.Label(), 56)),
-			dim(fmt.Sprintf("%s · %s · %d msgs", ago(s.Modified), truncate(s.Cwd, 34), s.Messages)))
+		return bold(truncate(s.Label(), 56)) + "  " +
+			dim(fmt.Sprintf("%s · %s · %d msgs", ago(s.Modified), truncate(s.Cwd, 34), s.Messages))
+	})
+	if err != nil {
+		return session.Session{}, err
+	}
+	return sessions[i], nil
+}
+
+// choose shows a numbered menu of the first 20 of count items and returns the
+// index of the one picked.
+func choose(prompt string, count int, label func(i int) string) (int, error) {
+	if count == 1 {
+		return 0, nil
+	}
+	max := min(count, 20)
+	fmt.Fprintln(os.Stderr, prompt)
+	for i := 0; i < max; i++ {
+		fmt.Fprintf(os.Stderr, "  %2d) %s\n", i+1, label(i))
 	}
 	fmt.Fprintf(os.Stderr, "\nNumber [1]: ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && strings.TrimSpace(line) == "" {
-		return session.Session{}, fmt.Errorf("no selection")
+		return 0, fmt.Errorf("no selection")
 	}
 	line = strings.TrimSpace(line)
 	if line == "" {
-		return sessions[0], nil
+		return 0, nil
 	}
 	var n int
 	if _, err := fmt.Sscanf(line, "%d", &n); err != nil || n < 1 || n > max {
-		return session.Session{}, fmt.Errorf("invalid selection %q", line)
+		return 0, fmt.Errorf("invalid selection %q", line)
 	}
-	return sessions[n-1], nil
+	return n - 1, nil
 }
 
 func ago(t time.Time) string {

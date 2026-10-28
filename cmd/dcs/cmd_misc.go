@@ -105,25 +105,37 @@ func cmdRemove(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	info, err := client.Head(ctx, streamPath)
-	if err != nil {
-		return err
+	// The raw replica goes too, so removing a session leaves no copy behind.
+	var targets []string
+	for _, p := range []string{streamPath, streamPath + "/jsonl"} {
+		info, err := client.Head(ctx, p)
+		if err != nil {
+			return err
+		}
+		if info.Exists {
+			targets = append(targets, p)
+			if !*yes {
+				fmt.Fprintf(os.Stderr, "  %s (%d records)\n", client.URL(p, nil), info.Records())
+			}
+		}
 	}
-	if !info.Exists {
+	if len(targets) == 0 {
 		fmt.Fprintln(os.Stderr, "no such stream: "+streamPath)
 		return nil
 	}
 	if !*yes {
-		fmt.Fprintf(os.Stderr, "Delete %s (%d records)? [y/N] ", client.URL(streamPath, nil), info.Records())
+		fmt.Fprintf(os.Stderr, "Delete the stream(s) above? [y/N] ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "y") {
 			return errors.New("aborted")
 		}
 	}
-	if err := client.Delete(ctx, streamPath); err != nil {
-		return err
+	for _, p := range targets {
+		if err := client.Delete(ctx, p); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "deleted "+p)
 	}
-	fmt.Fprintln(os.Stderr, "deleted "+streamPath)
 	return nil
 }
 
