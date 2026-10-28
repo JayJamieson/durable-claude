@@ -19,6 +19,7 @@ var ErrDiverged = errors.New("local copy has changes the stream doesn't")
 // stream, never rewritten, so a session resumed locally is left alone.
 type Assembler struct {
 	dir     string
+	home    string // this machine's home directory, or "" to keep the pusher's project
 	session string // the session the stream path names
 
 	header  *Header
@@ -29,9 +30,12 @@ type Assembler struct {
 	err     error  // sticky: a diverged or broken stream stays that way
 }
 
-// NewAssembler writes the transcript of session under dir.
-func NewAssembler(dir, session string) *Assembler {
-	return &Assembler{dir: dir, session: session}
+// NewAssembler writes the transcript of session under dir. If the pusher's cwd
+// maps to a directory under home, the transcript goes in the project directory
+// that Claude Code uses for it. An empty home keeps the pusher's project
+// directory.
+func NewAssembler(dir, home, session string) *Assembler {
+	return &Assembler{dir: dir, home: home, session: session}
 }
 
 // File is the local transcript path, known once the header has been applied.
@@ -82,7 +86,7 @@ func (a *Assembler) applyHeader(h Header) error {
 		return fmt.Errorf("replica header names session %s, but the stream is for %s", h.Session, a.session)
 	}
 	a.header = &h
-	a.file = filepath.Join(a.dir, h.Project, h.Session+".jsonl")
+	a.file = filepath.Join(a.dir, h.localProject(a.home), h.Session+".jsonl")
 	fi, err := os.Stat(a.file)
 	switch {
 	case err == nil:

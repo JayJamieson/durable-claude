@@ -372,8 +372,9 @@ func pushReplica(ctx context.Context, common *commonFlags, sess session.Session,
 	if title == sess.ID {
 		title = ""
 	}
+	home, _ := os.UserHomeDir()
 	p := replica.NewPusher(client, path, sess.File, replica.Header{
-		Session: sess.ID, Project: sess.Project, Cwd: sess.Cwd, Title: title,
+		Session: sess.ID, Project: sess.Project, Cwd: sess.Cwd, Home: home, Title: title,
 	})
 	if err := p.Start(ctx); err != nil {
 		if ctx.Err() != nil {

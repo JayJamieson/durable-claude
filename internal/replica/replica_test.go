@@ -99,10 +99,11 @@ func pass(t *testing.T, p *Pusher) int64 {
 	return n
 }
 
-// assemble applies records into dir and flushes, returning the bytes written.
-func assemble(t *testing.T, dir string, records []json.RawMessage) (*Assembler, int64) {
+// assemble applies records into dir on a host whose home is home and flushes,
+// returning the bytes written.
+func assemble(t *testing.T, dir, home string, records []json.RawMessage) (*Assembler, int64) {
 	t.Helper()
-	a := NewAssembler(dir, testSession)
+	a := NewAssembler(dir, home, testSession)
 	for _, r := range records {
 		if err := a.Apply(r); err != nil {
 			t.Fatal(err)
@@ -160,7 +161,7 @@ func TestPushThenAssembleRoundTrips(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	_, n := assemble(t, dir, s.records)
+	_, n := assemble(t, dir, "", s.records)
 	if got := readFile(t, hostFile(dir)); got != body {
 		t.Fatalf("host file is %d bytes, want the %d pushed bytes exactly", len(got), len(body))
 	}
@@ -187,7 +188,7 @@ func TestPartialLineWaitsForItsNewline(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	assemble(t, dir, s.records)
+	assemble(t, dir, "", s.records)
 	if got := readFile(t, hostFile(dir)); got != "one\ntwo\n" {
 		t.Fatalf("host file = %q", got)
 	}
@@ -210,7 +211,7 @@ func TestRestartedPusherResumesFromTheStream(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	assemble(t, dir, s.records)
+	assemble(t, dir, "", s.records)
 	if got, want := readFile(t, hostFile(dir)), readFile(t, file); got != want {
 		t.Fatalf("host file differs from the guest after a restart:\n got %d bytes\nwant %d bytes", len(got), len(want))
 	}
@@ -250,7 +251,7 @@ func TestLongLineIsSplitAndWrittenWhole(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	a := NewAssembler(dir, testSession)
+	a := NewAssembler(dir, "", testSession)
 	for i, r := range s.records {
 		if err := a.Apply(r); err != nil {
 			t.Fatal(err)
@@ -279,13 +280,13 @@ func TestDuplicateAndOverlappingRecordsAssembleOnce(t *testing.T) {
 	pass(t, first)  // just the new tail
 
 	dir := t.TempDir()
-	assemble(t, dir, s.records)
+	assemble(t, dir, "", s.records)
 	if got, want := readFile(t, hostFile(dir)), readFile(t, file); got != want {
 		t.Fatalf("two pushers assembled to %d bytes, want %d", len(got), len(want))
 	}
 
 	dir = t.TempDir()
-	assemble(t, dir, []json.RawMessage{
+	assemble(t, dir, "", []json.RawMessage{
 		rec(t, header()),
 		rec(t, Chunk{Off: 0, Data: []byte("abc\nde")}),
 		rec(t, Chunk{Off: 2, Data: []byte("c\ndef\n")}),
@@ -300,7 +301,7 @@ func TestDuplicateAndOverlappingRecordsAssembleOnce(t *testing.T) {
 
 func TestGapIsAnError(t *testing.T) {
 	dir := t.TempDir()
-	a, _ := assemble(t, dir, []json.RawMessage{rec(t, header()), rec(t, Chunk{Off: 0, Data: []byte("a\n")})})
+	a, _ := assemble(t, dir, "", []json.RawMessage{rec(t, header()), rec(t, Chunk{Off: 0, Data: []byte("a\n")})})
 
 	err := a.Apply(rec(t, Chunk{Off: 5, Data: []byte("late\n")}))
 	if err == nil || errors.Is(err, ErrDiverged) {
@@ -316,7 +317,7 @@ func TestGapIsAnError(t *testing.T) {
 
 func TestHostResumeDiverges(t *testing.T) {
 	dir := t.TempDir()
-	a, _ := assemble(t, dir, []json.RawMessage{rec(t, header()), rec(t, Chunk{Off: 0, Data: []byte("a\n")})})
+	a, _ := assemble(t, dir, "", []json.RawMessage{rec(t, header()), rec(t, Chunk{Off: 0, Data: []byte("a\n")})})
 	writeFile(t, hostFile(dir), "resumed on the host\n")
 
 	if err := a.Apply(rec(t, Chunk{Off: 2, Data: []byte("b\n")})); err != nil {
@@ -331,7 +332,7 @@ func TestHostResumeDiverges(t *testing.T) {
 
 	dir = t.TempDir()
 	writeFile(t, hostFile(dir), "zzz\n")
-	b := NewAssembler(dir, testSession)
+	b := NewAssembler(dir, "", testSession)
 	if err := b.Apply(rec(t, header())); err != nil {
 		t.Fatal(err)
 	}
@@ -353,11 +354,11 @@ func TestRestartWritesOnlyNewBytes(t *testing.T) {
 	p := newPusher(t, s, file)
 	pass(t, p)
 	dir := t.TempDir()
-	assemble(t, dir, s.records)
+	assemble(t, dir, "", s.records)
 
 	writeFile(t, file, "new one\nnew two\n")
 	pass(t, p)
-	a, n := assemble(t, dir, s.records)
+	a, n := assemble(t, dir, "", s.records)
 	if n != int64(len("new one\nnew two\n")) {
 		t.Fatalf("a fresh assembler wrote %d bytes, want only the 16 new ones", n)
 	}
@@ -369,7 +370,7 @@ func TestRestartWritesOnlyNewBytes(t *testing.T) {
 	}
 
 	writeFile(t, hostFile(dir), "typed on the host\n")
-	a, n = assemble(t, dir, s.records)
+	a, n = assemble(t, dir, "", s.records)
 	if n != 0 || !a.Ahead() {
 		t.Fatalf("wrote %d, Ahead %v; want nothing written and the local copy reported ahead", n, a.Ahead())
 	}
@@ -394,7 +395,7 @@ func TestHeaderValidation(t *testing.T) {
 			root := t.TempDir()
 			dir := filepath.Join(root, "projects")
 			h.V, h.Kind = Version, Kind
-			a := NewAssembler(dir, testSession)
+			a := NewAssembler(dir, "", testSession)
 			if err := a.Apply(rec(t, h)); err == nil {
 				t.Fatal("header accepted")
 			}
@@ -415,8 +416,97 @@ func TestHeaderValidation(t *testing.T) {
 }
 
 func TestStreamMustStartWithAHeader(t *testing.T) {
-	a := NewAssembler(t.TempDir(), testSession)
+	a := NewAssembler(t.TempDir(), "", testSession)
 	if err := a.Apply(rec(t, Chunk{Off: 0, Data: []byte("x\n")})); err == nil {
 		t.Fatal("a chunk before the header was accepted")
+	}
+}
+
+const (
+	guestHome = "/home/ubuntu"
+	guestCwd  = guestHome + "/.herdr/worktrees/data/x"
+)
+
+// guestHeader describes a session in a herdr worktree on a slicer VM.
+func guestHeader() Header {
+	return Header{Session: testSession, Project: "-home-ubuntu--herdr-worktrees-data-x", Cwd: guestCwd, Home: guestHome}
+}
+
+// saveGuest pushes body from a guest that sends h, assembles the stream into a
+// fresh projects dir on a host whose home is home, and returns that dir.
+func saveGuest(t *testing.T, h Header, home, body string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "guest.jsonl")
+	writeFile(t, file, body)
+	s := &fakeStream{}
+	p := NewPusher(s, "/claude/p/s/jsonl", file, h)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pass(t, p)
+	dir := t.TempDir()
+	assemble(t, dir, home, s.records)
+	return dir
+}
+
+// claudeFolder is the folder name Claude Code gives a working directory.
+func claudeFolder(path string) string {
+	return strings.Map(func(r rune) rune {
+		if 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' {
+			return r
+		}
+		return '-'
+	}, path)
+}
+
+func mkdirs(t *testing.T, root string, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSaveUsesTheHostWorktreeFolder(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, home, ".herdr/worktrees/data/x")
+	body := transcript(50)
+
+	dir := saveGuest(t, guestHeader(), home, body)
+	want := filepath.Join(dir, claudeFolder(filepath.Join(home, ".herdr/worktrees/data/x")), testSession+".jsonl")
+	if got := readFile(t, want); got != body {
+		t.Fatalf("%s holds %d bytes, want the %d guest bytes", want, len(got), len(body))
+	}
+}
+
+func TestSaveFallsBackToTheGuestFolder(t *testing.T) {
+	hostHome := t.TempDir()
+	deep := ".herdr/worktrees/data/x"
+	for len(claudeFolder(filepath.Join(hostHome, deep))) <= 200 {
+		deep += "/deeper"
+	}
+	// Each case has a directory that the mapping would find without the guard
+	// for that case. For "mapping off", that directory is hostHome itself.
+	mkdirs(t, hostHome, ".herdr/worktrees/data/x", guestCwd, "srv/x", "-old/x", deep)
+
+	cases := map[string]struct{ cwd, home, hostHome string }{
+		"host directory missing": {cwd: guestHome + "/.herdr/worktrees/data/gone", home: guestHome, hostHome: hostHome},
+		"no home in the header":  {cwd: guestCwd, hostHome: hostHome},
+		"cwd outside home":       {cwd: "/srv/x", home: guestHome, hostHome: hostHome},
+		"cwd beside home":        {cwd: guestHome + "-old/x", home: guestHome, hostHome: hostHome},
+		"folder name over 200":   {cwd: guestHome + "/" + deep, home: guestHome, hostHome: hostHome},
+		"mapping off":            {cwd: guestHome + hostHome, home: guestHome},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := guestHeader()
+			h.Cwd, h.Home = c.cwd, c.home
+			body := transcript(20)
+			dir := saveGuest(t, h, c.hostHome, body)
+			if got := readFile(t, filepath.Join(dir, h.Project, testSession+".jsonl")); got != body {
+				t.Fatalf("guest folder holds %d bytes, want the %d guest bytes", len(got), len(body))
+			}
+		})
 	}
 }

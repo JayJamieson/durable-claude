@@ -179,7 +179,8 @@ func printable(s string) string {
 // saveSession catches the local transcript up with the replica stream and, with
 // follow, keeps appending as the stream grows.
 func saveSession(ctx context.Context, client *dstream.Client, dir string, r remoteSession, follow bool) error {
-	a := replica.NewAssembler(dir, r.id)
+	home, _ := os.UserHomeDir()
+	a := replica.NewAssembler(dir, home, r.id)
 	failed := func(err error) error {
 		if errors.Is(err, replica.ErrDiverged) {
 			return fmt.Errorf("diverged %s: local copy has changes the stream doesn't (resumed here?); left alone", r.short())

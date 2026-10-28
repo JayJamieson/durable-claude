@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // Version is the replica record schema version.
@@ -33,13 +36,41 @@ type Header struct {
 	V       int    `json:"v"`
 	Kind    string `json:"kind"`
 	Session string `json:"session"`
-	Project string `json:"project"` // the exact directory name under ~/.claude/projects
+	Project string `json:"project"` // the pusher's directory name under ~/.claude/projects
 	Cwd     string `json:"cwd,omitempty"`
+	Home    string `json:"home,omitempty"` // the pusher's home directory
 	Title   string `json:"title,omitempty"`
 }
 
 // Ref names the transcript a header describes.
 func (h Header) Ref() Ref { return Ref{Project: h.Project, Session: h.Session} }
+
+// Claude Code shortens longer names and adds a hash dcs cannot reproduce.
+const maxProjectName = 200
+
+var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9]`)
+
+// localProject is the directory name under the local projects dir. It maps Cwd
+// from the pusher's home onto home and returns the name Claude Code gives that
+// path. It returns the pusher's Project when it cannot map Cwd to a local
+// directory.
+func (h Header) localProject(home string) string {
+	if home == "" || h.Home == "" || h.Cwd == "" {
+		return h.Project
+	}
+	if h.Cwd != h.Home && !strings.HasPrefix(h.Cwd, h.Home+"/") {
+		return h.Project
+	}
+	local := filepath.Join(home, strings.TrimPrefix(h.Cwd, h.Home))
+	if fi, err := os.Stat(local); err != nil || !fi.IsDir() {
+		return h.Project
+	}
+	name := nonAlnum.ReplaceAllString(local, "-")
+	if len(name) > maxProjectName {
+		return h.Project
+	}
+	return name
+}
 
 // Chunk is a run of transcript bytes starting at Off. Data is a []byte so it
 // travels as base64: a JSON object would be re-encoded by the server and lose

@@ -148,8 +148,14 @@ dcs save 529128a1 -follow     # copy it, then keep appending as the guest writes
 claude --resume 529128a1-9fec-432e-b80a-bb7c1e7b1f46
 ```
 
-`dcs save` writes `~/.claude/projects/<project>/<id>.jsonl` under the guest's
-project directory name. `claude --resume <id>` finds it from any directory.
+`dcs save` writes `~/.claude/projects/<project>/<id>.jsonl`. It maps the guest's
+working directory from the guest's home to your home, so `/home/you/code/thing`
+on the guest becomes `~/code/thing` on the host. If that directory exists on the
+host, `<project>` is the project directory that Claude Code uses for it. Then
+`claude --continue` in that directory finds the session. If the directory does
+not exist, or an older `dcs` started the stream, `<project>` is the guest's
+project directory name. `claude --resume <id>` finds the session from any
+directory.
 
 Each pushed session has a second stream next to the viewer stream:
 
@@ -158,8 +164,9 @@ Each pushed session has a second stream next to the viewer stream:
 /claude/home-you-code-thing/529128a1-.../jsonl    the raw transcript
 ```
 
-Record 0 of `<stream>/jsonl` is a header that names the session and its project
-directory. Every later record is `{"off": <byte offset>, "data": "<base64>"}`
+Record 0 of `<stream>/jsonl` is a header that names the session, its project
+directory, its working directory, and the guest's home directory. Every later
+record is `{"off": <byte offset>, "data": "<base64>"}`
 with at most 256 KiB of the file. The data is base64 because yasdb re-encodes
 JSON objects, which would change the transcript's bytes. `dcs push` sends
 complete lines and resumes from the stream's last record, so a restart leaves no
