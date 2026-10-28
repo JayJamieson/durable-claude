@@ -185,6 +185,19 @@ If the guest has written nothing new since, `dcs save` reports that the local
 copy is ahead and leaves it alone. To take the guest's copy again, move the host
 file aside and run `dcs save` once more.
 
+`dcs rm`, `dcs cat`, and `dcs url` find a session's streams on the server by the
+session id. They do not use the host's project directory name, so they work on a
+session that `dcs save` wrote under a different name. If you push a session from
+the host, `dcs push` publishes it under the host's project directory name. That
+stream is separate from the guest's stream. `dcs rm` then deletes every copy,
+with the viewer events and the raw transcript of each. `dcs cat`, `dcs url`, and
+`dcs save` stop and list the paths. Pass `-stream <path>` to pick one.
+
+If you save a session before the host directory exists and again after you
+create it, the host has two copies in two project directories. `dcs save` prints
+a warning that names the other copy. `claude --resume <id>` can open either
+copy, so delete the copy you do not want.
+
 ## Stream layout
 
 A session lands at `<prefix>/<project>/<session-id>`, for example:

@@ -26,7 +26,7 @@ func cmdCat(ctx context.Context, args []string) error {
 		return err
 	}
 
-	streamPath, client, err := targetStream(common, arg(fs))
+	streamPath, client, err := targetStream(ctx, common, arg(fs))
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func cmdURL(ctx context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	streamPath, client, err := targetStream(common, arg(fs))
+	streamPath, client, err := targetStream(ctx, common, arg(fs))
 	if err != nil {
 		return err
 	}
@@ -101,40 +101,51 @@ func cmdRemove(ctx context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	streamPath, client, err := targetStream(common, arg(fs))
+	client, err := dstream.New(common.server, "")
 	if err != nil {
 		return err
 	}
-	// The raw replica goes too, so removing a session leaves no copy behind.
-	var targets []string
-	for _, p := range []string{streamPath, streamPath + "/jsonl"} {
-		info, err := client.Head(ctx, p)
+	// The raw replica goes too, and so does every project path that holds the
+	// session, so removing a session leaves no copy behind.
+	var targets []dstream.StreamSummary
+	streamPath := ""
+	if common.stream != "" {
+		streamPath = "/" + strings.TrimLeft(common.stream, "/")
+		for _, p := range []string{streamPath, streamPath + "/jsonl"} {
+			info, err := client.Head(ctx, p)
+			if err != nil {
+				return err
+			}
+			if info.Exists {
+				targets = append(targets, dstream.StreamSummary{Path: p, Records: info.Records()})
+			}
+		}
+	} else {
+		s, err := findSession(ctx, client, common, arg(fs))
 		if err != nil {
 			return err
 		}
-		if info.Exists {
-			targets = append(targets, p)
-			if !*yes {
-				fmt.Fprintf(os.Stderr, "  %s (%d records)\n", client.URL(p, nil), info.Records())
-			}
-		}
+		streamPath, targets = s.derived, s.streams
 	}
 	if len(targets) == 0 {
 		fmt.Fprintln(os.Stderr, "no such stream: "+streamPath)
 		return nil
 	}
 	if !*yes {
+		for _, t := range targets {
+			fmt.Fprintf(os.Stderr, "  %s (%d records)\n", client.URL(t.Path, nil), t.Records)
+		}
 		fmt.Fprintf(os.Stderr, "Delete the stream(s) above? [y/N] ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "y") {
 			return errors.New("aborted")
 		}
 	}
-	for _, p := range targets {
-		if err := client.Delete(ctx, p); err != nil {
+	for _, t := range targets {
+		if err := client.Delete(ctx, t.Path); err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stderr, "deleted "+p)
+		fmt.Fprintln(os.Stderr, "deleted "+t.Path)
 	}
 	return nil
 }
@@ -187,21 +198,21 @@ func cmdStreams(ctx context.Context, args []string) error {
 	return nil
 }
 
-// targetStream resolves a selector to a stream path plus a client. An explicit
-// -stream skips the on-disk lookup entirely, so streams can be read back on a
-// machine that never had the transcript.
-func targetStream(common *commonFlags, selector string) (string, *dstream.Client, error) {
-	streamPath := ""
-	if common.stream != "" {
-		streamPath = "/" + strings.TrimLeft(common.stream, "/")
-	} else {
-		sess, err := common.resolve(selector, true)
-		if err != nil {
-			return "", nil, err
-		}
-		streamPath = common.streamPath(sess)
+// targetStream resolves a selector to the one viewer stream that cat and url
+// read. An explicit -stream skips the on-disk lookup and the server listing.
+func targetStream(ctx context.Context, common *commonFlags, selector string) (string, *dstream.Client, error) {
+	client, err := dstream.New(common.server, "")
+	if err != nil {
+		return "", nil, err
 	}
-	client, err := common.client(streamPath)
+	if common.stream != "" {
+		return "/" + strings.TrimLeft(common.stream, "/"), client, nil
+	}
+	s, err := findSession(ctx, client, common, selector)
+	if err != nil {
+		return "", nil, err
+	}
+	streamPath, err := s.viewer()
 	return streamPath, client, err
 }
 

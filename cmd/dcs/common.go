@@ -84,15 +84,21 @@ func arg(fs *flag.FlagSet) string {
 // the selector is ambiguous.
 func (c *commonFlags) resolve(selector string, fast bool) (session.Session, error) {
 	s, err := session.Resolve(c.dir, selector, fast)
+	return s, explainAmbiguous(err)
+}
+
+// explainAmbiguous prints the sessions an ambiguous selector matched and asks
+// for a narrower one. Any other error passes through.
+func explainAmbiguous(err error) error {
 	var amb *session.Ambiguous
-	if err != nil && asAmbiguous(err, &amb) {
-		fmt.Fprintln(os.Stderr, "dcs: selector matches several sessions:")
-		for _, m := range amb.Matches {
-			fmt.Fprintf(os.Stderr, "  %s  %s  %s\n", m.Short(), m.Cwd, m.Label())
-		}
-		return session.Session{}, fmt.Errorf("be more specific (a session id prefix is always unique)")
+	if !asAmbiguous(err, &amb) {
+		return err
 	}
-	return s, err
+	fmt.Fprintln(os.Stderr, "dcs: selector matches several sessions:")
+	for _, m := range amb.Matches {
+		fmt.Fprintf(os.Stderr, "  %s  %s  %s\n", m.Short(), m.Cwd, m.Label())
+	}
+	return fmt.Errorf("be more specific (a session id prefix is always unique)")
 }
 
 func asAmbiguous(err error, target **session.Ambiguous) bool {

@@ -132,8 +132,12 @@ func (r Ref) Validate() error {
 	if !projectRE.MatchString(r.Project) || r.Project[0] == '.' {
 		return errors.New("project must be a plain directory name")
 	}
-	if !sessionRE.MatchString(r.Session) {
+	if !IsSessionID(r.Session) {
 		return errors.New("session must be a lowercase UUID")
 	}
 	return nil
 }
+
+// IsSessionID reports whether s has the form of a Claude Code session id, a
+// lowercase UUID.
+func IsSessionID(s string) bool { return sessionRE.MatchString(s) }

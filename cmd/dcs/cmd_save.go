@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unicode"
@@ -63,18 +64,15 @@ func listRemoteSessions(ctx context.Context, client *dstream.Client, common *com
 	if common.stream != "" {
 		root = common.stream
 	}
-	prefix := "/"
-	if p := strings.Trim(root, "/"); p != "" {
-		prefix += p + "/"
-	}
+	prefix := listPrefix(root)
 	streams, err := client.ListStreams(ctx, prefix, 0)
 	if err != nil {
 		return nil, err
 	}
 	var out []remoteSession
 	for _, s := range streams {
-		if strings.HasSuffix(s.Path, "/jsonl") {
-			out = append(out, remoteSession{path: s.Path, id: path.Base(path.Dir(s.Path)), records: s.Records})
+		if id := sessionID(s.Path); strings.HasSuffix(s.Path, "/jsonl") && replica.IsSessionID(id) {
+			out = append(out, remoteSession{path: s.Path, id: id, records: s.Records})
 		}
 	}
 	if len(out) == 0 {
@@ -104,16 +102,26 @@ func selectRemote(ctx context.Context, client *dstream.Client, remotes []remoteS
 		return remoteSession{}, errors.New("pass a session id to save one")
 	}
 
-	var byID, byPath []remoteSession
+	var exact, byID, byPath []remoteSession
 	for _, r := range remotes {
 		switch {
 		case r.id == selector:
-			return r, nil
+			exact = append(exact, r)
 		case strings.HasPrefix(r.id, selector):
 			byID = append(byID, r)
 		case strings.Contains(r.path, selector):
 			byPath = append(byPath, r)
 		}
+	}
+	if len(exact) == 1 {
+		return exact[0], nil
+	}
+	if len(exact) > 1 {
+		var paths []string
+		for _, r := range exact {
+			paths = append(paths, strings.TrimSuffix(r.path, "/jsonl"))
+		}
+		return remoteSession{}, severalPaths(selector, paths)
 	}
 	for _, group := range [][]remoteSession{byID, byPath} {
 		switch len(group) {
@@ -224,6 +232,9 @@ func saveSession(ctx context.Context, client *dstream.Client, dir string, r remo
 	default:
 		fmt.Printf("up to date %s (%s)  claude --resume %s\n", r.short(), humanBytes(a.Size()), r.id)
 	}
+	if a.File() != "" {
+		warnOtherCopies(dir, a.File(), r.id)
+	}
 	if !follow {
 		return nil
 	}
@@ -252,4 +263,25 @@ func saveSession(ctx context.Context, client *dstream.Client, dir string, r remo
 		return failed(err)
 	}
 	return nil
+}
+
+// warnOtherCopies names every other local copy of a session. A save before
+// the host worktree exists and a save after it put one session in two project
+// directories, and claude --resume can open either.
+func warnOtherCopies(dir, written, id string) {
+	copies, _ := filepath.Glob(filepath.Join(dir, "*", id+".jsonl"))
+	var others []string
+	for _, c := range copies {
+		if c != written {
+			others = append(others, c)
+		}
+	}
+	if len(others) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "dcs: warning: session %s also has a local copy at:\n", id)
+	for _, c := range others {
+		fmt.Fprintln(os.Stderr, "  "+c)
+	}
+	fmt.Fprintf(os.Stderr, "dcs: claude --resume %s can open any copy, so delete the copies you do not want\n", id)
 }
