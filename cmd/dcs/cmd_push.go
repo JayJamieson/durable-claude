@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JayJamieson/durable-claude/internal/replica"
 	"github.com/JayJamieson/durable-claude/internal/session"
 	"github.com/JayJamieson/durable-claude/internal/tailer"
 )
@@ -20,44 +21,142 @@ import (
 // already holds, no matter how the batches were split last time.
 const headerSeq = -1
 
+// pushOptions are the push flags that shape how one session is published.
+type pushOptions struct {
+	from        string
+	follow      bool
+	reset       bool
+	closeAtEnd  bool
+	dryRun      bool
+	jsonl       bool
+	norm        session.Options
+	batchEvents int
+	batchBytes  int
+	interval    time.Duration
+	poll        time.Duration
+	wait        time.Duration
+}
+
 func cmdPush(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	common := addCommon(fs)
-	from := fs.String("from", "auto", "where to start: auto | start | end | resume")
-	follow := fs.Bool("follow", true, "keep tailing the file for new writes")
-	reset := fs.Bool("reset", false, "delete and recreate the stream first")
-	closeAtEnd := fs.Bool("close", false, "close the stream (EOF) when the tail stops")
-	meta := fs.Bool("meta", false, "include bookkeeping records (mode changes, snapshots, queue ops)")
-	raw := fs.Bool("raw", false, "attach the original JSONL record to every event")
-	maxText := fs.Int("max-text", 16000, "truncate text fields past this many bytes (0 = unlimited)")
-	maxInput := fs.Int("max-input", 8000, "truncate tool inputs past this many bytes (0 = unlimited)")
-	batchEvents := fs.Int("batch", 200, "flush after this many buffered events")
-	batchBytes := fs.Int("batch-bytes", 512*1024, "flush after this many buffered bytes")
-	interval := fs.Duration("interval", 200*time.Millisecond, "maximum time an event waits before being flushed")
-	poll := fs.Duration("poll", 250*time.Millisecond, "how often to check the file for new writes")
-	wait := fs.Duration("wait", 0, "wait this long for the transcript file to appear")
-	dryRun := fs.Bool("dry-run", false, "print events instead of sending them")
+	var opt pushOptions
+	fs.StringVar(&opt.from, "from", "auto", "where to start: auto | start | end | resume")
+	fs.BoolVar(&opt.follow, "follow", true, "keep tailing the file for new writes")
+	fs.BoolVar(&opt.reset, "reset", false, "delete and recreate the stream first")
+	fs.BoolVar(&opt.closeAtEnd, "close", false, "close the stream (EOF) when the tail stops")
+	fs.BoolVar(&opt.norm.Meta, "meta", false, "include bookkeeping records (mode changes, snapshots, queue ops)")
+	fs.BoolVar(&opt.norm.Raw, "raw", false, "attach the original JSONL record to every event")
+	fs.IntVar(&opt.norm.MaxText, "max-text", 16000, "truncate text fields past this many bytes (0 = unlimited)")
+	fs.IntVar(&opt.norm.MaxInput, "max-input", 8000, "truncate tool inputs past this many bytes (0 = unlimited)")
+	fs.IntVar(&opt.batchEvents, "batch", 200, "flush after this many buffered events")
+	fs.IntVar(&opt.batchBytes, "batch-bytes", 512*1024, "flush after this many buffered bytes")
+	fs.DurationVar(&opt.interval, "interval", 200*time.Millisecond, "maximum time an event waits before being flushed")
+	fs.DurationVar(&opt.poll, "poll", 250*time.Millisecond, "how often to check the file for new writes")
+	fs.DurationVar(&opt.wait, "wait", 0, "wait this long for the transcript file to appear")
+	fs.BoolVar(&opt.dryRun, "dry-run", false, "print events instead of sending them")
+	fs.BoolVar(&opt.jsonl, "jsonl", true, "also copy the raw transcript to <stream>/jsonl, for dcs save")
+	all := fs.Bool("all", false, "publish every session that is created or written to while dcs runs")
 	quiet := fs.Bool("quiet", false, "only print errors")
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-
-	sess, err := selectSession(common, arg(fs))
-	if err != nil {
-		return err
-	}
-	opt := session.Options{MaxText: *maxText, MaxInput: *maxInput, Meta: *meta, Raw: *raw}
 
 	logf := func(format string, a ...any) {
 		if !*quiet {
 			fmt.Fprintf(os.Stderr, format+"\n", a...)
 		}
 	}
+	if *all {
+		if arg(fs) != "" || common.stream != "" || opt.reset {
+			return errors.New("-all watches every session; it takes no selector, -stream or -reset")
+		}
+		opt.follow = true
+		return pushAll(ctx, common, opt, logf)
+	}
+	sess, err := selectSession(common, arg(fs))
+	if err != nil {
+		return err
+	}
+	return pushSession(ctx, common, sess, opt, logf)
+}
+
+// pushAll publishes every session that is created or grows while it runs, each
+// in its own goroutine. Sessions untouched since it started stay unpublished.
+func pushAll(ctx context.Context, common *commonFlags, opt pushOptions, logf func(string, ...any)) error {
+	list := func() ([]session.Session, error) {
+		sessions, err := session.AllSessions(common.dir, true)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // no session has run on this machine yet
+		}
+		return sessions, err
+	}
+	sessions, err := list()
+	if err != nil {
+		return err
+	}
+	started := map[string]int64{} // transcript → its size when last started, or at startup
+	for _, s := range sessions {
+		started[s.File] = s.Size
+	}
+	logf("%s watching %s; %d existing session(s) wait until they change", dim("    all"), common.dir, len(sessions))
+
+	running := map[string]bool{}
+	done := make(chan string)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	ticker := time.NewTicker(opt.poll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case file := <-done:
+			delete(running, file)
+		case <-ticker.C:
+			sessions, err := list()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dcs: %v\n", err)
+				continue
+			}
+			for _, s := range sessions {
+				if size, ok := started[s.File]; running[s.File] || ok && s.Size <= size {
+					continue
+				}
+				started[s.File] = s.Size
+				running[s.File] = true
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					short := s.Short()
+					if full, err := session.Resolve(common.dir, s.File, false); err == nil {
+						s = full // the listing skips titles; the stream headers want them
+					}
+					err := pushSession(ctx, common, s, opt, func(format string, a ...any) {
+						logf("%s "+format, append([]any{short}, a...)...)
+					})
+					if err != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "%s %s %v; retrying when it next grows\n", short, dim("  error"), err)
+					}
+					select {
+					case done <- s.File:
+					case <-ctx.Done():
+					}
+				}()
+			}
+		}
+	}
+}
+
+// pushSession publishes one session's events to its stream, replaying and then
+// following the transcript as opt says.
+func pushSession(ctx context.Context, common *commonFlags, sess session.Session, opt pushOptions,
+	logf func(string, ...any)) error {
 	logf("%s %s", bold("session"), sess.Label())
 	logf("%s %s", dim("   file"), sess.File)
 
-	if *dryRun {
-		return dryRunPush(ctx, sess, opt, *from == "end", *follow, *poll, *wait, logf)
+	if opt.dryRun {
+		return dryRunPush(ctx, sess, opt.norm, opt.from == "end", opt.follow, opt.poll, opt.wait, logf)
 	}
 
 	streamPath := common.streamPath(sess)
@@ -66,10 +165,19 @@ func cmdPush(ctx context.Context, args []string) error {
 		return err
 	}
 	logf("%s %s", dim(" stream"), client.URL(streamPath, nil))
+	replicaPath := streamPath + "/jsonl"
+	if opt.jsonl {
+		logf("%s %s", dim("replica"), client.URL(replicaPath, nil))
+	}
 
-	if *reset {
+	if opt.reset {
 		if err := client.Delete(ctx, streamPath); err != nil {
 			return err
+		}
+		if opt.jsonl {
+			if err := client.Delete(ctx, replicaPath); err != nil {
+				return err
+			}
 		}
 		logf("%s deleted the existing stream", dim("  reset"))
 	}
@@ -93,7 +201,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	// --- decide where in the file to start --------------------------------
 	fromEnd := false
 	resumeSeq := headerSeq // events at or below this ordinal are already sent
-	switch *from {
+	switch opt.from {
 	case "auto", "resume":
 		if existing > 0 {
 			resumeSeq, err = lastSentSeq(ctx, client, streamPath, info)
@@ -101,7 +209,7 @@ func cmdPush(ctx context.Context, args []string) error {
 				return fmt.Errorf("work out where to resume: %w", err)
 			}
 			logf("%s resuming after %d record(s) on the server", dim("   mode"), existing)
-		} else if *from == "resume" {
+		} else if opt.from == "resume" {
 			logf("%s nothing on the server yet, replaying from the start", dim("   mode"))
 		} else {
 			logf("%s replaying from the start", dim("   mode"))
@@ -117,7 +225,7 @@ func cmdPush(ctx context.Context, args []string) error {
 		fromEnd = true
 		logf("%s live only, skipping existing history", dim("   mode"))
 	default:
-		return fmt.Errorf("-from must be auto, start, end or resume (got %q)", *from)
+		return fmt.Errorf("-from must be auto, start, end or resume (got %q)", opt.from)
 	}
 	if existing > 0 {
 		logf("%s %d record(s) already on the server", dim(" server"), existing)
@@ -126,8 +234,8 @@ func cmdPush(ctx context.Context, args []string) error {
 	// --- batching ---------------------------------------------------------
 	sent := 0
 	b := &batcher{
-		maxEvents: *batchEvents,
-		maxBytes:  *batchBytes,
+		maxEvents: opt.batchEvents,
+		maxBytes:  opt.batchBytes,
 		send: func(payload []byte, count int) error {
 			if _, err := client.AppendJSON(ctx, streamPath, payload); err != nil {
 				return err
@@ -141,7 +249,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(*interval)
+		ticker := time.NewTicker(opt.interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -167,27 +275,44 @@ func cmdPush(ctx context.Context, args []string) error {
 	// that a later resume lines up. Counting is a parse-only pass over the file.
 	ord := 0
 	if fromEnd {
-		if ord, err = countEvents(sess.File, opt); err != nil {
+		if ord, err = countEvents(sess.File, opt.norm); err != nil {
 			return err
 		}
 	}
 
+	// The replica runs beside the tail with its own client, so a failure in
+	// either stops both and the caller sees it.
+	tailCtx, stopTail := context.WithCancel(ctx)
+	defer stopTail()
+	var replicaDone chan error
+
 	live := false
 	filter := &session.Filter{}
-	tailErr := tailer.Tail(ctx, sess.File, tailer.Options{
-		FromEnd: fromEnd, Follow: *follow, Poll: *poll, WaitForFile: *wait,
+	tailErr := tailer.Tail(tailCtx, sess.File, tailer.Options{
+		FromEnd: fromEnd, Follow: opt.follow, Poll: opt.poll, WaitForFile: opt.wait,
 		CaughtUp: func(int) {
 			live = true
 			b.Flush()
-			if *follow {
+			if opt.follow {
 				logf("%s caught up (%d event(s) sent); following %s", dim("   live"), sent, sess.File)
 				if url := common.viewerURL(client.Server(), streamPath, "start"); url != "" {
 					logf("%s %s", dim(" viewer"), url)
 				}
 			}
+			// Started here rather than up front, because by now the file exists.
+			if opt.jsonl {
+				replicaDone = make(chan error, 1)
+				go func() {
+					err := pushReplica(tailCtx, common, sess, replicaPath, opt, logf)
+					if err != nil {
+						stopTail()
+					}
+					replicaDone <- err
+				}()
+			}
 		},
 	}, func(line []byte, lineNo int) error {
-		for _, e := range session.Normalize(line, lineNo, opt) {
+		for _, e := range session.Normalize(line, lineNo, opt.norm) {
 			seq := ord
 			ord++
 			if seq <= resumeSeq || !filter.Keep(e) {
@@ -209,11 +334,19 @@ func cmdPush(ctx context.Context, args []string) error {
 	if err := b.Flush(); err != nil && tailErr == nil {
 		tailErr = err
 	}
+	if replicaDone != nil {
+		if tailErr != nil {
+			stopTail()
+		}
+		if err := <-replicaDone; err != nil {
+			return fmt.Errorf("replica: %w", err)
+		}
+	}
 	if tailErr != nil && !errors.Is(tailErr, context.Canceled) {
 		return tailErr
 	}
 
-	if *closeAtEnd {
+	if opt.closeAtEnd {
 		if err := client.CloseStream(ctx, streamPath); err != nil {
 			return err
 		}
@@ -224,6 +357,49 @@ func cmdPush(ctx context.Context, args []string) error {
 		logf("%s %s", dim(" viewer"), url)
 	}
 	return nil
+}
+
+// pushReplica keeps the stream at path a byte-exact copy of the transcript, for
+// dcs save on another machine. Every start resumes from what the server holds,
+// so -from applies to the viewer stream only.
+func pushReplica(ctx context.Context, common *commonFlags, sess session.Session, path string,
+	opt pushOptions, logf func(string, ...any)) error {
+	client, err := common.client(path)
+	if err != nil {
+		return err
+	}
+	title := sess.Label()
+	if title == sess.ID {
+		title = ""
+	}
+	p := replica.NewPusher(client, path, sess.File, replica.Header{
+		Session: sess.ID, Project: sess.Project, Cwd: sess.Cwd, Title: title,
+	})
+	if err := p.Start(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	for first := true; ; first = false {
+		if _, err := p.Pass(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if first {
+			logf("%s caught up (%s); on the host: %s", dim("replica"), humanBytes(p.Sent()), common.saveCommand(sess.ID))
+		}
+		if !opt.follow {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(opt.poll):
+		}
+	}
 }
 
 // headerEvent describes the session the stream carries.

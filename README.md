@@ -21,6 +21,11 @@ Built against [yasdb](https://github.com/JayJamieson/yasdb), which is what
 > push to a public deployment is readable by anyone who can reach it, and chat
 > transcripts contain your prompts, file contents, and command output. Push to a
 > server you control, or treat what you publish as public.
+>
+> **The raw replica is the whole transcript.** `dcs push` also writes
+> `<stream>/jsonl` for `dcs save`. Unlike the viewer events, it is not
+> truncated: it holds every prompt, tool output, and file content. Anyone who can
+> reach the server can read it or append to it. Pass `-jsonl=false` to skip it.
 
 ## Install
 
@@ -70,15 +75,20 @@ Every command takes the same selector:
 A selector that matches several sessions in one project picks the newest. One
 that straddles projects is rejected, and the candidates are listed.
 
+`dcs save` matches against the sessions on the server instead: a session id, a
+unique id prefix, or a substring of the stream path.
+
 ## Commands
 
 ```
 dcs list [selector]     list projects and sessions      -json -fast -flat -n
 dcs push [selector]     publish a session to a stream   see below
+dcs save [selector]     write a pushed session locally  -follow -dir
 dcs cat  [selector]     read a stream in the terminal   -from start|end -follow -json
 dcs url  [selector]     print the viewer deep link      -from start|end
-dcs rm   [selector]     delete a session's stream       -y
+dcs rm   [selector]     delete a session's streams      -y
 dcs streams             list streams on the server      -all -json
+dcs service <action>    run push -all from boot         install | uninstall | print
 ```
 
 Shared flags: `-dir` (default `~/.claude/projects`, `$DCS_DIR`), `-server`
@@ -102,12 +112,71 @@ Shared flags: `-dir` (default `~/.claude/projects`, `$DCS_DIR`), `-server`
 | `-poll` | `250ms` | how often to check the file for new writes |
 | `-wait` | `0` | wait this long for the transcript to appear (useful before starting a session) |
 | `-dry-run` | `false` | print events to stdout instead of publishing |
+| `-jsonl` | `true` | also copy the raw transcript to `<stream>/jsonl`, for `dcs save` |
+| `-all` | `false` | publish every session that starts or grows while `dcs` runs; implies `-follow` |
 
 Resuming is exact rather than approximate: every published event carries the
 ordinal of the transcript event it came from, so `push` reads the stream's last
 record, learns that ordinal, and skips precisely what the server already holds.
 Re-running `dcs push` on a session you pushed an hour ago appends only what has
 happened since — no duplicates, no gaps.
+
+## Resume a VM session on your Mac
+
+You can run Claude Code in a VM (the guest) and resume the same session on your
+Mac (the host) with `claude --resume <id>`. The session travels through the
+Durable Streams server, so the guest and the host never connect to each other.
+
+On the guest, install `dcs`, then install the boot service once:
+
+```bash
+go install github.com/JayJamieson/durable-claude/cmd/dcs@latest
+sudo "$(command -v dcs)" service install
+```
+
+The service is a systemd unit, `dcs-push`, that runs `dcs push -all` as you. It
+publishes every session that starts or grows after boot and leaves untouched
+sessions unpublished. Put extra push flags after `--`, as in
+`service install -- -prefix /vm`. `dcs service print` shows the unit, and
+`sudo "$(command -v dcs)" service uninstall` removes it.
+
+On the host:
+
+```bash
+dcs save                      # pick one of the sessions on the server
+dcs save 529128a1 -follow     # copy it, then keep appending as the guest writes
+claude --resume 529128a1-9fec-432e-b80a-bb7c1e7b1f46
+```
+
+`dcs save` writes `~/.claude/projects/<project>/<id>.jsonl` under the guest's
+project directory name. `claude --resume <id>` finds it from any directory.
+
+Each pushed session has a second stream next to the viewer stream:
+
+```
+/claude/home-you-code-thing/529128a1-...          viewer events
+/claude/home-you-code-thing/529128a1-.../jsonl    the raw transcript
+```
+
+Record 0 of `<stream>/jsonl` is a header that names the session and its project
+directory. Every later record is `{"off": <byte offset>, "data": "<base64>"}`
+with at most 256 KiB of the file. The data is base64 because yasdb re-encodes
+JSON objects, which would change the transcript's bytes. `dcs push` sends
+complete lines and resumes from the stream's last record, so a restart leaves no
+gap and a duplicate record is harmless.
+
+`dcs save` only appends. It compares the bytes the host file already holds with
+the stream and never rewrites them. When you resume on the host, Claude Code
+appends to the host file, and the next byte the guest writes no longer matches.
+`dcs save` then stops writing to that file and exits non-zero:
+
+```
+dcs: diverged 529128a1: local copy has changes the stream doesn't (resumed here?); left alone
+```
+
+If the guest has written nothing new since, `dcs save` reports that the local
+copy is ahead and leaves it alone. To take the guest's copy again, move the host
+file aside and run `dcs save` once more.
 
 ## Stream layout
 
@@ -118,7 +187,9 @@ A session lands at `<prefix>/<project>/<session-id>`, for example:
 ```
 
 The stream's content type is `application/json`, so a batch posted as an array
-is flattened by the server into one record per event.
+is flattened by the server into one record per event. The raw transcript for
+`dcs save` lives at `<stream>/jsonl`; see
+[Resume a VM session on your Mac](#resume-a-vm-session-on-your-mac).
 
 ## Event schema
 
@@ -204,6 +275,7 @@ make vet fmt
 ```
 
 Tests cover the normalizer, the file tailer (partial lines, truncation,
-rotation, `-from end` numbering) and the stream client (retries, resume, SSE
-framing) against an in-process fake server. Nothing in the suite needs network
-access.
+rotation, `-from end` numbering), the stream client (retries, resume, SSE
+framing) against an in-process fake server, and the replica round trip (resume,
+split lines, gaps, divergence, hostile headers) against an in-memory stream.
+Nothing in the suite needs network access.

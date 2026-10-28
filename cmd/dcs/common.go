@@ -158,3 +158,16 @@ func (c *commonFlags) viewerURL(server, streamPath, from string) string {
 	}
 	return base + sep + q.Encode()
 }
+
+// saveCommand is what to run on another machine to fetch a session's replica,
+// naming -server and -prefix only when they differ from the defaults.
+func (c *commonFlags) saveCommand(id string) string {
+	cmd := "dcs save " + id
+	if c.server != defaultServer {
+		cmd += " -server " + c.server
+	}
+	if strings.Trim(c.prefix, "/") != "claude" {
+		cmd += " -prefix " + c.prefix
+	}
+	return cmd
+}
